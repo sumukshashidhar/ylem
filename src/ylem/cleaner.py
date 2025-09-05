@@ -51,6 +51,7 @@ class Cleaner:
       {"nano": "your/nano", "large": "your/large"}.
     - system_prompt: default system prompt used for all calls unless overridden.
     - suppress_warnings: if True, mute most Transformers/HF Hub warnings.
+    - repetition_penalty: optional slight penalty (>1.0) to reduce repeats.
     """
 
     def __init__(
@@ -60,6 +61,7 @@ class Cleaner:
         aliases: dict[str, str] | None = None,
         system_prompt: str | None = "Strength: Medium",
         suppress_warnings: bool = True,
+        repetition_penalty: float | None = 1.05,
     ) -> None:
         # Resolve model id using provided alias map, env vars, or raw id.
         alias_map = {**DEFAULT_MODELS, **(aliases or {})}
@@ -93,6 +95,7 @@ class Cleaner:
 
         # Store defaults
         self.system_prompt = system_prompt
+        self.repetition_penalty = repetition_penalty
 
         # Log some init details
         try:
@@ -111,6 +114,7 @@ class Cleaner:
         *,
         max_new_tokens: int = 2048,
         system_prompt: str | None = None,
+        repetition_penalty: float | None = None,
         **gen_kwargs: Any,
     ) -> str:
         """Generate Markdown from input text using an HF model.
@@ -147,6 +151,11 @@ class Cleaner:
 
         # Generate
         t_gen_start = perf_counter()
+        rp = repetition_penalty if repetition_penalty is not None else self.repetition_penalty
+        # Only forward if provided; some models ignore/override unsupported params.
+        if rp is not None:
+            gen_kwargs.setdefault("repetition_penalty", float(rp))
+
         outputs = self.pipe(
             prompt,
             max_new_tokens=max_new_tokens,
@@ -171,7 +180,7 @@ class Cleaner:
             (
                 "gen stats | prompt_tokens={} | out_tokens={} | "
                 "prep_time={:.3f}s (template={:.3f}s, encode={:.3f}s) | "
-                "gen_time={:.3f}s | total={:.3f}s | tok/s={:.2f}"
+                "gen_time={:.3f}s | total={:.3f}s | tok/s={:.2f} | rep_penalty={}"
             ),
             prompt_tokens,
             out_tokens,
@@ -181,6 +190,7 @@ class Cleaner:
             t_gen,
             total_time,
             toks_per_sec,
+            rp,
         )
 
         return generated
