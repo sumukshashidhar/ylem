@@ -1,112 +1,114 @@
-"""Minimal Hugging Face-backed Cleaner.
-
-Dead-simple wrapper around `transformers` so you can do:
-
-    import ylem
-    cleaner = ylem.Cleaner("nano", system_prompt="Strength: Medium")
-    # or "large" or an HF repo id; you can also override aliases
-    # like {"nano": "your/nano-model", "large": "your/large-model"}.
-    markdown = cleaner("some text")
-
-Adds:
- - Model selection via aliases ("nano"/"large") or direct HF repo id.
- - Optional `system_prompt` at init or per-call.
- - Suppressed Transformers warnings for a cleaner output.
- - `loguru`-based debug logs with generation timing and token stats.
-
-Assumes dependencies are installed and available. Fails fast otherwise.
-"""
-
-from __future__ import annotations
-
-from typing import Any, Literal
+from dataclasses import dataclass, field
+from enum import StrEnum
 from time import perf_counter
-import os
-import warnings
+from typing import Any
 
+import os
+
+from loguru import logger
 from transformers import pipeline
 from transformers.utils import logging as hf_logging
-from loguru import logger
 
 
-# Accepted model sizes for the initial API.
-ModelSize = Literal["nano", "large"]
+class Size(StrEnum):
+    """Model size aliases."""
+    nano = "nano"
+    medium = "medium"
+    large = "large"
+
+
+class Strength(StrEnum):
+    """Cleaning aggressiveness levels."""
+    low = "low"
+    medium = "medium"
+    high = "high"
 
 
 DEFAULT_MODELS: dict[str, str] = {
-    # Small instruction-tuned Gemma 3 (works for quick local tests)
-    "nano": "textcleanlm/gemma-3-270m-0.05-ckpt",
-    # Placeholder: map 'large' to the same by default. Override via env
-    # var YLEM_MODEL_LARGE or pass a HF repo id to Cleaner(model=...).
-    "large": "textcleanlm/gemma-3-4b-0.01-ckpt",
+    "nano": "Qwen/Qwen3-0.6B",
+    "medium": "Qwen/Qwen3-4B-Instruct-2507",
+    "large": "Qwen/Qwen3-4B-Instruct-2507",
 }
 
 
+@dataclass(slots=True)
 class Cleaner:
-    """Create a text cleaner that outputs Markdown.
+    """Minimal text cleaner that prompts an LLM to return Markdown.
 
-    Parameters
-    - model: alias ("nano"/"large") or HF repo id (e.g. "google/gemma-3-270m-it").
-    - aliases: optional mapping to override default aliases, e.g.
-      {"nano": "your/nano", "large": "your/large"}.
-    - system_prompt: default system prompt used for all calls unless overridden.
-    - suppress_warnings: if True, mute most Transformers/HF Hub warnings.
-    - repetition_penalty: optional slight penalty (>1.0) to reduce repeats.
+    Fields:
+      - model: alias ("nano"/"medium"/"large") or HF repo id.
+      - strength: cleaning level ("low"/"medium"/"high").
+      - aliases: optional alias→repo map merged with built-ins.
+      - system_prompt: default system message; built from strength if None.
+      - suppress_warnings: hide HF warnings.
+      - repetition_penalty: generation penalty to reduce repeats.
     """
+    model: Size | str = Size.nano
+    strength: Strength | str = Strength.low
+    aliases: dict[str, str] | None = None
+    system_prompt: str | None = None
+    suppress_warnings: bool = True
+    repetition_penalty: float | None = 1.05
 
-    def __init__(
-        self,
-        model: ModelSize | str = "nano",
-        *,
-        aliases: dict[str, str] | None = None,
-        system_prompt: str | None = "Strength: Medium",
-        suppress_warnings: bool = True,
-        repetition_penalty: float | None = 1.05,
-    ) -> None:
-        # Resolve model id using provided alias map, env vars, or raw id.
-        alias_map = {**DEFAULT_MODELS, **(aliases or {})}
-        name = str(model)
-        base_id = alias_map.get(name, name)
-        self.model_id: str = (
-            os.getenv(f"YLEM_MODEL_{name.upper()}", base_id)
-            if name in alias_map
-            else base_id
-        )
+    model_id: str = field(init=False)
+    pipe: Any = field(init=False, repr=False)
 
-        if suppress_warnings:
-            # Quiet down Transformers + HF Hub advisory logs and general warnings.
+    def __post_init__(self) -> None:
+        """Initialize pipeline/tokenizer, set defaults, and configure logging/warnings."""
+        amap = DEFAULT_MODELS | (self.aliases or {})
+        name = self.model.value if isinstance(self.model, Size) else str(self.model)
+        base = amap.get(name, name)
+        if name in amap: base = os.getenv(f"YLEM_MODEL_{name.upper()}", base)
+
+        if self.suppress_warnings:
             os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
             os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
             os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
             hf_logging.set_verbosity_error()
-            warnings.filterwarnings("ignore", module=r"transformers(\..*)?")
-            warnings.filterwarnings("ignore", category=UserWarning)
 
-        # Initialize pipeline
+        self.model_id = base
         self.pipe = pipeline("text-generation", model=self.model_id)
+
         tok = self.pipe.tokenizer
-        # Avoid pad/eos warnings during generation
-        try:
-            if getattr(tok, "pad_token_id", None) is None and getattr(tok, "eos_token_id", None) is not None:
-                tok.pad_token = tok.eos_token  # type: ignore[attr-defined]
-        except Exception:
-            # Best-effort; continue even if tokenizer does not expose these attrs.
-            pass
+        if tok.pad_token_id is None and tok.eos_token_id is not None: tok.pad_token = tok.eos_token
 
-        # Store defaults
-        self.system_prompt = system_prompt
-        self.repetition_penalty = repetition_penalty
+        if self.system_prompt is None: self.system_prompt = self._build_system_prompt(self.strength)
 
-        # Log some init details
-        try:
-            logger.debug(
-                "Cleaner initialized | model_id='{}' | device={} | tokenizer='{}'",
-                self.model_id,
-                getattr(self.pipe, "device", None),
-                type(tok).__name__,
-            )
-        except Exception:
-            pass
+        logger.debug("Cleaner init | model_id={} | tokenizer={}", self.model_id, type(tok).__name__)
+
+    def _resolve_model_id(self, model: Size | str | None, aliases: dict[str, str] | None) -> str:
+        """Resolve a repo id from alias/env/overrides; returns the effective HF repo id."""
+        amap = DEFAULT_MODELS | (self.aliases or {}) | (aliases or {})
+        name = (model.value if isinstance(model, Size) else str(model)) if model is not None else (self.model.value if isinstance(self.model, Size) else str(self.model))
+        base = amap.get(name, name)
+        if name in amap: base = os.getenv(f"YLEM_MODEL_{name.upper()}", base)
+        return base
+
+    def _ensure_pipe(self, *, model: Size | str | None = None, aliases: dict[str, str] | None = None, suppress_warnings: bool | None = None) -> None:
+        """Reload the pipeline if the resolved model changed; optionally update warnings behavior."""
+        if suppress_warnings is not None: self.suppress_warnings = suppress_warnings
+        if self.suppress_warnings:
+            os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+            os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+            os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+            hf_logging.set_verbosity_error()
+
+        desired = self._resolve_model_id(model, aliases)
+        if desired != self.model_id:
+            self.model_id = desired
+            self.pipe = pipeline("text-generation", model=self.model_id)
+            tok = self.pipe.tokenizer
+            if tok.pad_token_id is None and tok.eos_token_id is not None: tok.pad_token = tok.eos_token
+            logger.debug("Cleaner reload | model_id={} | tokenizer={}", self.model_id, type(tok).__name__)
+
+    def _to_strength(self, s: Strength | str | None) -> Strength:
+        """Normalize input to a Strength enum; defaults to low."""
+        return s if isinstance(s, Strength) else Strength((s or "low").lower())
+
+    def _build_system_prompt(self, s: Strength | str) -> str:
+        """Build the default system prompt string for a given cleaning strength."""
+        lvl = self._to_strength(s).value.capitalize()
+        return f"Remove irrelevant elements from the content, and convert to markdown. Cleaning Strength: {lvl}"
 
     def __call__(
         self,
@@ -114,83 +116,43 @@ class Cleaner:
         *,
         max_new_tokens: int = 2048,
         system_prompt: str | None = None,
+        strength: Strength | str | None = None,
+        model: Size | str | None = None,
+        aliases: dict[str, str] | None = None,
+        suppress_warnings: bool | None = None,
         repetition_penalty: float | None = None,
         **gen_kwargs: Any,
     ) -> str:
-        """Generate Markdown from input text using an HF model.
+        """Clean text into Markdown using the configured LLM.
 
-        Parameters
-        - text: input text to clean.
-        - max_new_tokens: generation budget.
-        - system_prompt: optional override for the default system prompt.
-        - gen_kwargs: forwarded to `transformers.pipeline(...)(...)`.
+        Supports per-call overrides for model/aliases/warnings, strength/system prompt,
+        and forwards any extra kwargs to `transformers.pipeline("text-generation")`.
+        Returns the generated text only.
         """
+        self._ensure_pipe(model=model, aliases=aliases, suppress_warnings=suppress_warnings)
         tok = self.pipe.tokenizer
+        sp = system_prompt if system_prompt is not None else (self._build_system_prompt(strength) if strength is not None else self.system_prompt)
+        messages = ([{"role": "system", "content": sp}] if sp else []) + [{"role": "user", "content": text}]
 
-        # Build messages and render chat template
-        sys_msg = system_prompt if system_prompt is not None else self.system_prompt
-        messages: list[dict[str, str]] = []
-        if sys_msg:
-            messages.append({"role": "system", "content": sys_msg})
-        messages.append({"role": "user", "content": text})
+        t0 = perf_counter()
+        prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt_tokens = len(tok(prompt, add_special_tokens=False).get("input_ids", []))
+        t_prep = perf_counter() - t0
 
-        t_template_start = perf_counter()
-        prompt = tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        t_template = perf_counter() - t_template_start
-
-        # Tokenize (for stats only)
-        t_encode_start = perf_counter()
-        try:
-            enc = tok(prompt, add_special_tokens=False)
-            prompt_tokens = len(enc.get("input_ids", []))
-        except Exception:
-            prompt_tokens = 0
-        t_encode = perf_counter() - t_encode_start
-
-        # Generate
-        t_gen_start = perf_counter()
         rp = repetition_penalty if repetition_penalty is not None else self.repetition_penalty
-        # Only forward if provided; some models ignore/override unsupported params.
-        if rp is not None:
-            gen_kwargs.setdefault("repetition_penalty", float(rp))
+        kwargs = {"max_new_tokens": max_new_tokens, "return_full_text": False} | gen_kwargs
+        if rp is not None: kwargs["repetition_penalty"] = float(rp)
 
-        outputs = self.pipe(
-            prompt,
-            max_new_tokens=max_new_tokens,
-            return_full_text=False,
-            **gen_kwargs,
-        )
-        t_gen = perf_counter() - t_gen_start
+        t1 = perf_counter()
+        out = self.pipe(prompt, **kwargs)
+        t_gen = perf_counter() - t1
 
-        generated = outputs[0]["generated_text"]
-
-        # Tokenize output (for stats only)
-        try:
-            out_ids = tok(generated, add_special_tokens=False).get("input_ids", [])
-            out_tokens = len(out_ids)
-        except Exception:
-            out_tokens = 0
-
-        total_time = t_template + t_encode + t_gen
-        toks_per_sec = (out_tokens / t_gen) if t_gen > 0 and out_tokens else 0.0
+        gen = out[0]["generated_text"]
+        out_tokens = len(tok(gen, add_special_tokens=False).get("input_ids", []))
+        tps = (out_tokens / t_gen) if t_gen > 0 and out_tokens else 0.0
 
         logger.debug(
-            (
-                "gen stats | prompt_tokens={} | out_tokens={} | "
-                "prep_time={:.3f}s (template={:.3f}s, encode={:.3f}s) | "
-                "gen_time={:.3f}s | total={:.3f}s | tok/s={:.2f} | rep_penalty={}"
-            ),
-            prompt_tokens,
-            out_tokens,
-            (t_template + t_encode),
-            t_template,
-            t_encode,
-            t_gen,
-            total_time,
-            toks_per_sec,
-            rp,
+            "gen | prompt_tokens={} | out_tokens={} | prep={:.3f}s | gen={:.3f}s | tok/s={:.2f} | rep_penalty={}",
+            prompt_tokens, out_tokens, t_prep, t_gen, tps, rp,
         )
-
-        return generated
+        return gen

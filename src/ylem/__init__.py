@@ -1,10 +1,8 @@
+from loguru import logger
+
 from .cleaner import Cleaner
 
-__all__ = [
-    "Cleaner",
-    "main",
-]
+__all__ = ("Cleaner", "main")
 
 
-def main() -> None:
-    print("Hello from ylem! This repo is not yet ready for use!")
+def main() -> None: logger.info("Hello from ylem! This repo is not yet ready for use!")

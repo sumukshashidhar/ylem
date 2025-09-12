@@ -1,6 +1,6 @@
 import ylem
 
-cleaner = ylem.Cleaner("large")
+cleaner = ylem.Cleaner("medium")
 text = """UNIVERSITY OF ILLINOIS URBANA-CHAMPAIGN
 Alumni
 Corporate
@@ -301,5 +301,5 @@ Copyright © 2025
 Accessibility
 Webmaster
 Login"""
-out = cleaner(text, do_sample=False)
+out = cleaner(text, do_sample=False, max_new_tokens=64)
 print(out)
