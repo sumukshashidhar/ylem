@@ -25,9 +25,9 @@ class Strength(StrEnum):
 
 
 DEFAULT_MODELS: dict[str, str] = {
-    "nano": "Qwen/Qwen3-0.6B",
-    "medium": "Qwen/Qwen3-4B-Instruct-2507",
-    "large": "Qwen/Qwen3-4B-Instruct-2507",
+    "nano": "textcleanlm/gemma3_270m_it_x01",
+    "medium" : "textcleanlm/gemma3_4b_it_x01",
+    "large": "textcleanlm/gemma3_4b_it_x01",
 }
 
 
